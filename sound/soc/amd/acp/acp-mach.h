@@ -43,6 +43,7 @@ enum codec_endpoints {
 	MAX98360A,
 	RT5682S,
 	NAU8825,
+	ES83XX,
 };
 
 enum platform_end_point {
