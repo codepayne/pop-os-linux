@@ -19,7 +19,17 @@
 #include <linux/io.h>
 #include <linux/acpi.h>
 #include <linux/dmi.h>
+#include <linux/circ_buf.h>
+
 #include "../acp-mach.h"
+
+#define RB_SIZE         32
+
+#define circ_count(circ)	  \
+	(CIRC_CNT((circ)->head, (circ)->tail, RB_SIZE))
+
+#define circ_space(circ)	  \
+	(CIRC_SPACE((circ)->head, (circ)->tail, RB_SIZE))
 
 #define get_mach_priv(card) ((struct acp3x_es83xx_private *)((acp_get_drvdata(card))->mach_priv))
 
@@ -31,14 +41,35 @@
 #define ES83XX_ENABLE_DMIC	BIT(4)
 #define ES83XX_48_MHZ_MCLK	BIT(5)
 
+enum {
+	SPEAKER_ON = 0,
+	SPEAKER_OFF,
+	SPEAKER_SUSPEND,
+	SPEAKER_RESUME,
+	SPEAKER_MAX
+};
+
+const char *msg[SPEAKER_MAX] = {
+	"SPEAKER_ON",
+	"SPEAKER_OFF",
+	"SPEAKER_SUSPEND",
+	"SPEAKER_RESUME"
+};
+
 struct acp3x_es83xx_private {
 	unsigned long quirk;
+	bool speaker_on;
+	bool stream_suspended;
 	struct snd_soc_component *codec;
 	struct device *codec_dev;
 	struct gpio_desc *gpio_speakers, *gpio_headphone;
 	struct acpi_gpio_params enable_spk_gpio, enable_hp_gpio;
 	struct acpi_gpio_mapping gpio_mapping[3];
 	struct snd_soc_dapm_route mic_map[2];
+	struct delayed_work jack_work;
+	struct mutex rb_lock;
+	struct circ_buf gpio_rb;
+	u8 gpio_events_buf[RB_SIZE];
 };
 
 static const unsigned int rates[] = {
@@ -83,6 +114,110 @@ static void acp3x_es83xx_set_gpios_values(struct acp3x_es83xx_private *priv,
 {
 	gpiod_set_value_cansleep(priv->gpio_speakers, speaker);
 	gpiod_set_value_cansleep(priv->gpio_headphone, headphone);
+}
+
+static void acp3x_es83xx_rb_insert_evt(struct circ_buf *rb, u8 val)
+{
+	u8 *buf = rb->buf;
+
+	if (circ_space(rb) == 0) {
+		/* make some space by dropping the oldest entry, we are more
+		 * interested in the last event
+		 */
+		rb->tail = (rb->tail + 1) & (RB_SIZE - 1);
+	}
+	buf[rb->head] = val;
+	rb->head = (rb->head + 1) & (RB_SIZE - 1);
+}
+
+static int acp3x_es83xx_rb_remove_evt(struct circ_buf *rb)
+{
+	u8 *buf = rb->buf;
+	int rc = -1;
+
+	if (circ_count(rb)) {
+		rc = buf[rb->tail];
+		rb->tail = (rb->tail + 1) & (RB_SIZE - 1);
+	}
+	return rc;
+}
+
+static void acp3x_es83xx_jack_events(struct work_struct *work)
+{
+	struct acp3x_es83xx_private *priv =
+		container_of(work, struct acp3x_es83xx_private, jack_work.work);
+	int evt;
+
+	mutex_lock(&priv->rb_lock);
+	do {
+		evt = acp3x_es83xx_rb_remove_evt(&priv->gpio_rb);
+		switch (evt) {
+		case SPEAKER_SUSPEND:
+			dev_dbg(priv->codec_dev, "jack event, %s\n", msg[evt]);
+			acp3x_es83xx_set_gpios_values(priv, 0, 0);
+			break;
+		case SPEAKER_RESUME:
+			dev_dbg(priv->codec_dev, "jack event, %s\n", msg[evt]);
+			acp3x_es83xx_set_gpios_values(priv, priv->speaker_on, !priv->speaker_on);
+			break;
+		case SPEAKER_ON:
+			dev_dbg(priv->codec_dev, "jack event, %s\n", msg[evt]);
+			priv->speaker_on = true;
+			acp3x_es83xx_set_gpios_values(priv, 1, 0);
+			break;
+		case SPEAKER_OFF:
+			dev_dbg(priv->codec_dev, "jack event, %s\n", msg[evt]);
+			priv->speaker_on = false;
+			acp3x_es83xx_set_gpios_values(priv, 0, 1);
+			break;
+		}
+	} while (evt != -1);
+	mutex_unlock(&priv->rb_lock);
+}
+
+static int acp3x_es83xx_trigger(struct snd_pcm_substream *substream, int cmd)
+{
+	struct snd_soc_pcm_runtime *rtd = asoc_substream_to_rtd(substream);
+	struct snd_soc_card *card = rtd->card;
+	struct acp3x_es83xx_private *priv = get_mach_priv(card);
+
+	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_START:
+	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+	case SNDRV_PCM_TRIGGER_RESUME:
+		if (substream->stream == 0) {
+			dev_dbg(priv->codec_dev, "trigger start/release/resume, activating GPIOs\n");
+			mutex_lock(&priv->rb_lock);
+			if (priv->stream_suspended) {
+				priv->stream_suspended = false;
+				acp3x_es83xx_rb_insert_evt(&priv->gpio_rb, SPEAKER_RESUME);
+				mutex_unlock(&priv->rb_lock);
+				queue_delayed_work(system_wq, &priv->jack_work,
+						   msecs_to_jiffies(1));
+			} else {
+				mutex_unlock(&priv->rb_lock);
+			}
+		}
+
+		break;
+
+	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+	case SNDRV_PCM_TRIGGER_SUSPEND:
+	case SNDRV_PCM_TRIGGER_STOP:
+		if (substream->stream == 0) {
+			dev_dbg(priv->codec_dev, "trigger pause/suspend/stop deactivating GPIOs\n");
+			mutex_lock(&priv->rb_lock);
+			priv->stream_suspended = true;
+			acp3x_es83xx_rb_insert_evt(&priv->gpio_rb, SPEAKER_SUSPEND);
+			mutex_unlock(&priv->rb_lock);
+			queue_delayed_work(system_wq, &priv->jack_work, msecs_to_jiffies(1));
+		}
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
 }
 
 static int acp3x_es83xx_create_swnode(struct device *codec_dev)
@@ -211,12 +346,18 @@ static int acp3x_es83xx_speaker_power_event(struct snd_soc_dapm_widget *w,
 					    struct snd_kcontrol *kcontrol, int event)
 {
 	struct acp3x_es83xx_private *priv = get_mach_priv(w->dapm->card);
+	u8 val;
 
 	dev_dbg(priv->codec_dev, "speaker power event: %d\n", event);
-	if (SND_SOC_DAPM_EVENT_ON(event))
-		acp3x_es83xx_set_gpios_values(priv, 1, 0);
-	else
-		acp3x_es83xx_set_gpios_values(priv, 0, 1);
+	val = SND_SOC_DAPM_EVENT_ON(event) ? SPEAKER_ON : SPEAKER_OFF;
+
+	dev_dbg(priv->codec_dev, "speaker power event = %s\n", msg[val]);
+
+	mutex_lock(&priv->rb_lock);
+	acp3x_es83xx_rb_insert_evt(&priv->gpio_rb, val);
+	mutex_unlock(&priv->rb_lock);
+
+	queue_delayed_work(system_wq, &priv->jack_work, msecs_to_jiffies(70));
 
 	return 0;
 }
@@ -353,6 +494,7 @@ static int acp3x_es83xx_init(struct snd_soc_pcm_runtime *runtime)
 
 static const struct snd_soc_ops acp3x_es83xx_ops = {
 	.startup = acp3x_es83xx_codec_startup,
+	.trigger = acp3x_es83xx_trigger,
 };
 
 
@@ -426,6 +568,12 @@ static int acp3x_es83xx_probe(struct snd_soc_card *card)
 
 		priv->quirk = (unsigned long)dmi_id->driver_data;
 		acp_drvdata->mach_priv = priv;
+
+		priv->gpio_rb.buf = priv->gpio_events_buf;
+		priv->gpio_rb.head = priv->gpio_rb.tail = 0;
+		mutex_init(&priv->rb_lock);
+
+		INIT_DELAYED_WORK(&priv->jack_work, acp3x_es83xx_jack_events);
 		dev_info(dev, "successfully probed the sound card\n");
 	} else {
 		ret = -ENODEV;
