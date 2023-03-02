@@ -3,7 +3,7 @@
 // Machine driver for AMD ACP Audio engine using ES8336 codec.
 //
 // Copyright 2023 Marian Postevca <posteuca@mutex.one>
-
+#define DEBUG
 #include <sound/core.h>
 #include <sound/soc.h>
 #include <sound/pcm.h>
