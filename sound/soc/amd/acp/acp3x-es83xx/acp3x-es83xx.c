@@ -10,6 +10,7 @@
 #include <sound/pcm_params.h>
 #include <sound/soc-dapm.h>
 #include <sound/jack.h>
+#include <sound/soc-acpi.h>
 #include <linux/clk.h>
 #include <linux/gpio.h>
 #include <linux/gpio/consumer.h>
@@ -452,31 +453,30 @@ static int acp3x_es83xx_init(struct snd_soc_pcm_runtime *runtime)
 	snd_soc_component_set_jack(codec, &es83xx_jack, NULL);
 
 	priv->codec = codec;
-	priv->codec_dev = codec->dev;
 	acp3x_es83xx_configure_gpios(priv);
 
-	ret = devm_acpi_dev_add_driver_gpios(codec->dev, priv->gpio_mapping);
+	ret = devm_acpi_dev_add_driver_gpios(priv->codec_dev, priv->gpio_mapping);
 	if (ret)
-		dev_warn(codec->dev, "failed to add speaker gpio\n");
+		dev_warn(priv->codec_dev, "failed to add speaker gpio\n");
 
-	priv->gpio_speakers = gpiod_get_optional(codec->dev, "speakers-enable",
+	priv->gpio_speakers = gpiod_get_optional(priv->codec_dev, "speakers-enable",
 				priv->enable_spk_gpio.active_low ? GPIOD_OUT_LOW : GPIOD_OUT_HIGH);
 	if (IS_ERR(priv->gpio_speakers)) {
-		dev_err(codec->dev, "could not get speakers-enable GPIO\n");
+		dev_err(priv->codec_dev, "could not get speakers-enable GPIO\n");
 		return PTR_ERR(priv->gpio_speakers);
 	}
 
-	priv->gpio_headphone = gpiod_get_optional(codec->dev, "headphone-enable",
+	priv->gpio_headphone = gpiod_get_optional(priv->codec_dev, "headphone-enable",
 				priv->enable_hp_gpio.active_low ? GPIOD_OUT_LOW : GPIOD_OUT_HIGH);
 	if (IS_ERR(priv->gpio_headphone)) {
-		dev_err(codec->dev, "could not get headphone-enable GPIO\n");
+		dev_err(priv->codec_dev, "could not get headphone-enable GPIO\n");
 		return PTR_ERR(priv->gpio_headphone);
 	}
 
 	if (priv->quirk & ES83XX_48_MHZ_MCLK) {
-		ret = acp3x_es83xx_create_swnode(codec->dev);
+		ret = acp3x_es83xx_create_swnode(priv->codec_dev);
 		if (ret != 0) {
-			dev_err(codec->dev,
+			dev_err(priv->codec_dev,
 				"could not create software node inside codec: %d\n", ret);
 			return ret;
 		}
@@ -486,7 +486,7 @@ static int acp3x_es83xx_init(struct snd_soc_pcm_runtime *runtime)
 	if (num_routes > 0) {
 		ret = snd_soc_dapm_add_routes(&card->dapm, priv->mic_map, num_routes);
 		if (ret != 0)
-			device_remove_software_node(codec->dev);
+			device_remove_software_node(priv->codec_dev);
 	}
 
 	return ret;
@@ -557,15 +557,33 @@ static int acp3x_es83xx_probe(struct snd_soc_card *card)
 	if (dmi_id && dmi_id->driver_data) {
 		struct acp3x_es83xx_private *priv;
 		struct acp_card_drvdata *acp_drvdata;
+		struct acpi_device *adev;
+		struct device *codec_dev;
 
 		acp_drvdata = (struct acp_card_drvdata *)card->drvdata;
 
 		dev_info(dev, "matched DMI table with this system, trying to register sound card\n");
 
-		priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
-		if (!priv)
-			return -ENOMEM;
+		adev = acpi_dev_get_first_match_dev(acp_drvdata->acpi_mach->id, NULL, -1);
+		if (!adev) {
+			dev_err(dev, "Error cannot find '%s' dev\n", acp_drvdata->acpi_mach->id);
+			return -ENXIO;
+		}
 
+		codec_dev = acpi_get_first_physical_node(adev);
+		acpi_dev_put(adev);
+		if (!codec_dev) {
+			dev_warn(dev, "Error cannot find codec device, will defer probe\n");
+			return -EPROBE_DEFER;
+		}
+
+		priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
+		if (!priv) {
+			put_device(codec_dev);
+			return -ENOMEM;
+		}
+
+		priv->codec_dev = codec_dev;
 		priv->quirk = (unsigned long)dmi_id->driver_data;
 		acp_drvdata->mach_priv = priv;
 

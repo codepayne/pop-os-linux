@@ -142,6 +142,8 @@ static int acp_asoc_probe(struct platform_device *pdev)
 	}
 
 	card->drvdata = (struct acp_card_drvdata *)pdev->id_entry->driver_data;
+	acp_card_drvdata = card->drvdata;
+	acp_card_drvdata->acpi_mach = (struct snd_soc_acpi_mach *)pdev->dev.platform_data;
 	card->dev = dev;
 	card->owner = THIS_MODULE;
 	card->name = pdev->id_entry->name;
@@ -170,8 +172,6 @@ static int acp_asoc_probe(struct platform_device *pdev)
 			card->name, ret);
 		goto out;
 	}
-
-	acp_card_drvdata = card->drvdata;
 
 	ret = acp_legacy_dai_links_create(card);
 	if (ret) {

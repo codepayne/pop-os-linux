@@ -71,6 +71,7 @@ struct acp_card_drvdata {
 	struct clk *wclk;
 	struct clk *bclk;
 	struct acp_mach_ops ops;
+	struct snd_soc_acpi_mach *acpi_mach;
 	void *mach_priv;
 	bool soc_mclk;
 };
