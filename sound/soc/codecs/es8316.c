@@ -87,7 +87,7 @@ static const struct soc_enum dacpol =
 	SOC_ENUM_SINGLE(ES8316_DAC_SET1, 0, 4, dacpol_txt);
 
 static const struct snd_kcontrol_new es8316_snd_controls[] = {
-	SOC_DOUBLE_TLV("Master Playback Volume", ES8316_CPHP_ICAL_VOL,
+	SOC_DOUBLE_TLV("Headphone Playback Volume", ES8316_CPHP_ICAL_VOL,
 		       4, 0, 3, 1, hpout_vol_tlv),
 	SOC_DOUBLE_TLV("Headphone Mixer Volume", ES8316_HPMIX_VOL,
 		       4, 0, 11, 0, hpmixer_gain_tlv),
